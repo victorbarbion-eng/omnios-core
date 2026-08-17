@@ -1,0 +1,42 @@
+{
+  "name": "omnios-core",
+  "private": true,
+  "version": "0.1.0",
+  "description": "Core orchestrator for a hybrid personal operating system: projects, files, agents, tasks, evidence, approvals, audit.",
+  "type": "module",
+  "workspaces": [
+    "packages/*",
+    "local-agent",
+    "apps/dashboard"
+  ],
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "typecheck": "tsc -b packages/shared local-agent",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "db:migrate": "tsx scripts/migrate.ts",
+    "db:seed": "tsx scripts/seed.ts",
+    "db:unseed": "tsx scripts/unseed.ts",
+    "db:claim": "tsx scripts/claim-ownership.ts",
+    "agent": "tsx local-agent/src/cli.ts",
+    "agent:demo": "tsx local-agent/src/cli.ts run-demo",
+    "agent:dry": "OMNIOS_DRY_RUN=true tsx local-agent/src/cli.ts run-demo",
+    "agent:refusals": "tsx local-agent/src/cli.ts refusals",
+    "pause": "tsx scripts/pause.ts",
+    "resume": "tsx scripts/pause.ts --off",
+    "dashboard": "npm run dev --workspace apps/dashboard"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.2",
+    "tsx": "^4.19.2",
+    "typescript": "^5.7.2",
+    "vitest": "^2.1.8"
+  },
+  "dependencies": {
+    "@supabase/supabase-js": "^2.47.10",
+    "dotenv": "^16.4.7",
+    "pg": "^8.13.1"
+  }
+}

@@ -1,0 +1,4 @@
+Initial result after applying 0007_fix_audit_trigger:
+Requested smoke query failed at project INSERT.
+PostgreSQL error 23502: null value in column "actor_type" of relation "audit_events" violates not-null constraint.
+The failing row was being written by os_write_audit() for projects.created. This is separate from the NEW.project_id resolution bug addressed by 0007.

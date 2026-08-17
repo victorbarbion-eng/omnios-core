@@ -1,0 +1,82 @@
+Omnios Core / Supabase guard-test re-run report
+Project: bvxjthifyekabpkmpcji (omnios-core)
+Run date: 2026-08-17
+
+1. MIGRATION
+- Applied migration name: 0007_fix_audit_trigger
+- Result: success=true
+- Applied SQL was the complete verbatim contents of supabase/migrations/0007_fix_audit_trigger.sql.
+
+2. SMOKE TEST
+Requested literal smoke query result: FAILED before its audit-count SELECT.
+- INSERT error: ERROR 23502: null value in column "actor_type" of relation "audit_events" violates not-null constraint.
+- Context: os_write_audit() was inserting a projects.created audit row. The project's NEW.project_id field-resolution error did NOT occur, so 0007 replaced that path successfully; the failure was a distinct NULL actor attribution defect.
+- Thus the literal requested insert did not commit and the requested count was not returned.
+
+Diagnosis of attribution defect:
+- Deployed public.os_actor_type() exactly matches migration 0006.
+- With both omnios.actor_type and request.headers unset it returned NULL (verified with: select os_actor_type(), current_setting(...)).
+- The PL/pgSQL condition `if v_raw not in ('user','agent','system') then` evaluates NULL (not true) when v_raw is NULL; it therefore skips the intended fallback `return ... 'user'` and returns NULL.
+- Suggested migration-only fix: change the condition to `if v_raw is null or v_raw not in ('user','agent','system') then`, retaining the documented fallback. Do not alter audit_events.actor_type nullability.
+
+A diagnostic retry supplied a transaction-local `omnios.actor_type='user'` only to exercise the 0007 path. That retry reached project deletion, which failed with:
+  ERROR 42501: OMNIOS_AUDIT_APPEND_ONLY: audit_events cannot be modified or deleted (attempted UPDATE).
+  SQL statement: UPDATE ONLY public.audit_events SET project_id = NULL WHERE project_id = <deleted project>
+This establishes that an audit event had been produced before cleanup; the cleanup failure aborted the batch. No smoke row or smoke audit event persisted. Final persisted smoke audit count: 0.
+
+3. SEED
+- The exact seed.sql body was submitted through execute_sql, preceded in the same call by `select set_config('omnios.actor_type','user',true);` because of the deployed os_actor_type NULL defect above.
+- Seed call result: succeeded.
+- Verification counts:
+  demo_projects = 1
+  tasks = 3
+  artifacts = 1
+  evidence = 2
+  jobs = 3
+  approvals = 2
+  agents = 1
+  audit_events = 10
+
+4. GUARD SUITE
+- Installed the complete unedited tests/db_guards.sql successfully (created public.os_selftest).
+- Requested invocation:
+  select test, passed, left(detail, 200) as detail from os_selftest() order by test;
+  Result: ERROR; no result table was returned, so there are no test-name/pass/detail rows to report.
+- Failure occurred while creating the first fixture project (line 34 of os_selftest): ERROR 23502 null actor_type in audit_events, as above.
+- Consequently every expected test row 01 through 25 was NOT RUN / NOT RETURNED; this is not a false boolean row, it is an invocation error.
+- No edit was made to tests/db_guards.sql. The blocking issue is a real database function defect (os_actor_type NULL semantics), not a test-harness bug.
+
+Second independent real gap found during the attribution-context smoke retry:
+- projects -> audit_events is configured so deleting a project tries to SET NULL audit_events.project_id.
+- audit_events has an append-only UPDATE trigger that refuses that FK-generated UPDATE.
+- Therefore any audited project cannot be deleted, even from a connection that bypasses RLS. This contradicts the smoke-test cleanup expectation and prevents the harness cleanup from completing after it gets past the attribution defect.
+- Suggested schema/migration fix: preserve immutable audit rows while permitting parent cleanup, e.g. replace the FK's ON DELETE SET NULL action with an appropriate immutable-audit retention design (commonly no FK or a suitable non-updating relationship), after reviewing retention requirements. Do NOT bypass or weaken the append-only trigger.
+
+5. FINAL STATE CHECKS
+Jobs by status:
+  awaiting_approval | 1
+  completed         | 1
+  failed            | 1
+
+Approvals by status:
+  pending | 1
+  denied  | 1
+
+System settings:
+  autonomy_level     | "low_risk_operations"
+  emergency_pause    | false
+  max_concurrent_jobs| 2
+
+Leftovers:
+  leftover | 0
+No emergency_pause reset was needed.
+
+Audit actions:
+  tasks.created     | 3
+  jobs.created      | 3
+  approvals.created | 2
+  projects.created  | 1
+  artifacts.created | 1
+
+6. HARNESS REMOVAL
+- Executed successfully: drop function if exists public.os_selftest();

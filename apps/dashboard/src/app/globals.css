@@ -1,0 +1,35 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root {
+  color-scheme: dark;
+}
+
+html,
+body {
+  background: #0b0c0e;
+  color: #e8eaed;
+}
+
+body {
+  font-size: 13px;
+  -webkit-font-smoothing: antialiased;
+}
+
+::selection {
+  background: #2563eb55;
+}
+
+/* Compact, utilitarian scrollbars for dense tables. */
+* {
+  scrollbar-width: thin;
+  scrollbar-color: #2a2f36 transparent;
+}
+*::-webkit-scrollbar {
+  height: 8px;
+  width: 8px;
+}
+*::-webkit-scrollbar-thumb {
+  background: #2a2f36;
+}
