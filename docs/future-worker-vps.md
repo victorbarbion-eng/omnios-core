@@ -40,4 +40,4 @@ Use a separate service-role or equivalent restricted server credential for the w
 
 ## Important enforcement limitation
 
-`agents.allowed_actions` and `allowed_project_scope` are stored and shown in the dashboard, and the shared `PolicyEngine` checks an action list when the caller provides it. The present database job trigger does not cross-check the job's `agent_id` against those arrays. A future worker must enforce that filter in its own claim logic until a database-level per-agent authorization guard is added.
+`agents.allowed_actions` and `allowed_project_scope` are enforced by the database trigger `os_guard_agent_grant()` (migrations `0009` and `0010`), so a future worker inherits the restriction whether or not it remembers to check. This is the whole argument for enforcing in the database: a worker written later, by someone else, obeys the same rules without being trusted to. Setting that agent's `status` to `paused` is its individual off switch, independent of the system-wide emergency pause.
