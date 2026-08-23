@@ -27,6 +27,14 @@ declare
   ap_old   uuid;
   n        integer;
   before_n bigint;
+  -- 0011 leasing fixtures
+  ag_rival uuid;
+  j_lease  uuid;
+  j_reap   uuid;
+  lease_a  jobs;
+  lease_b  jobs;
+  exp_1    timestamptz;
+  exp_2    timestamptz;
 begin
   -- ---------- fixtures ----------
   delete from projects where slug in ('selftest-project', 'selftest-other');
@@ -436,13 +444,227 @@ begin
     passed := false; detail := 'FAIL: ' || sqlerrm; return next;
   end;
 
+  -- =====================================================================
+  -- 0011 — job leasing. These test the guard that was never written:
+  -- two workers racing for one queued job. The true concurrency proof
+  -- needs two real sessions and lives in tests/concurrent_claim.sh;
+  -- everything below is the single-session logic around it.
+  -- =====================================================================
+
+  perform set_config('omnios.actor_type', 'system', true);
+  perform set_config('omnios.claimant_agent_id', '', true);
+
+  -- Empty the queue first. os_claim_next_job takes the OLDEST queued
+  -- job, so leftovers from tests 01-33 would be handed out instead of
+  -- the fixtures below and every assertion here would be about the
+  -- wrong row. queued -> cancelled is a legal transition.
+  update jobs set status = 'cancelled'
+   where owner_id = owner_a and status = 'queued';
+
+  -- The agent must be back on duty; test 33 left it paused.
+  update agents set status = 'idle' where id = ag_id;
+
+  insert into agents (owner_id, name, role, allowed_actions, status, is_demo)
+  values (owner_a, 'selftest-rival', 'second worker',
+          array['read_source','research_topic'], 'idle', true)
+  returning id into ag_rival;
+
+  insert into jobs (owner_id, project_id, job_type, idempotency_key, is_demo)
+  values (owner_a, p_id, 'read_source', 'selftest:lease:one', true)
+  returning id into j_lease;
+
+  -- ============ 34. an atomic claim takes exactly one job ============
+  begin
+    lease_a := os_claim_next_job(ag_id, 60, owner_a);
+    test := '34 atomic claim returns one job and leases it';
+    passed := (lease_a.id = j_lease
+               and lease_a.status = 'claimed'
+               and lease_a.leased_by = ag_id
+               and lease_a.lease_expires_at > now()
+               and lease_a.lease_count = 1);
+    detail := format('job %s claimed by %s until %s (lease_count=%s)',
+                     left(lease_a.id::text, 8), left(lease_a.leased_by::text, 8),
+                     lease_a.lease_expires_at, lease_a.lease_count);
+    return next;
+  exception when others then
+    test := '34 atomic claim returns one job and leases it';
+    passed := false; detail := 'FAIL: ' || sqlerrm; return next;
+  end;
+
+  -- ============ 35. the same job is not handed out twice ============
+  -- The second worker asking must not receive a job already leased.
+  begin
+    lease_b := os_claim_next_job(ag_rival, 60, owner_a);
+    test := '35 a second claim does not receive the leased job';
+    passed := (lease_b.id is null or lease_b.id is distinct from lease_a.id);
+    detail := case when lease_b.id is null
+                   then 'second worker got nothing, which is correct'
+                   when lease_b.id is distinct from lease_a.id
+                   then 'second worker got a different job, which is correct'
+                   else 'FAIL: second worker got the leased job' end;
+    return next;
+  exception when others then
+    test := '35 a second claim does not receive the leased job';
+    passed := false; detail := 'FAIL: ' || sqlerrm; return next;
+  end;
+
+  -- ============ 36. a rival cannot advance a live-leased job ============
+  begin
+    perform set_config('omnios.claimant_agent_id', ag_rival::text, true);
+    update jobs set status = 'running' where id = j_lease;
+    test := '36 a rival worker cannot advance a leased job';
+    passed := false; detail := 'FAIL: the rival moved a job it does not hold'; return next;
+  exception when others then
+    test := '36 a rival worker cannot advance a leased job';
+    passed := sqlerrm like 'OMNIOS_LEASE_HELD%';
+    detail := left(sqlerrm, 120); return next;
+  end;
+
+  -- ============ 37. the lease holder can advance it ============
+  begin
+    perform set_config('omnios.claimant_agent_id', ag_id::text, true);
+    update jobs set status = 'running' where id = j_lease;
+    test := '37 the lease holder can advance its own job';
+    select count(*) into n from jobs where id = j_lease and status = 'running';
+    passed := (n = 1); detail := format('running=%s', n); return next;
+  exception when others then
+    test := '37 the lease holder can advance its own job';
+    passed := false; detail := 'FAIL: ' || sqlerrm; return next;
+  end;
+
+  -- ============ 38. a non-holder cannot heartbeat ============
+  begin
+    perform os_heartbeat_job(j_lease, ag_rival, 60);
+    test := '38 a non-holder cannot renew the lease';
+    passed := false; detail := 'FAIL: the rival renewed a lease it does not hold'; return next;
+  exception when others then
+    test := '38 a non-holder cannot renew the lease';
+    passed := sqlerrm like 'OMNIOS_LEASE_NOT_HELD%';
+    detail := left(sqlerrm, 120); return next;
+  end;
+
+  -- ============ 39. the holder's heartbeat extends the lease ============
+  begin
+    select lease_expires_at into exp_1 from jobs where id = j_lease;
+    exp_2 := os_heartbeat_job(j_lease, ag_id, 900);
+    test := '39 the holder heartbeat extends the lease';
+    passed := (exp_2 > exp_1);
+    detail := format('%s -> %s', exp_1, exp_2); return next;
+  exception when others then
+    test := '39 the holder heartbeat extends the lease';
+    passed := false; detail := 'FAIL: ' || sqlerrm; return next;
+  end;
+
+  -- ============ 40. the pause refuses a heartbeat mid-flight ============
+  -- This is the half of the emergency pause that did not exist before
+  -- 0011: known-limitations.md recorded that a job already running
+  -- could not be stopped. A worker that heartbeats can now be told to
+  -- abort. read_source is read-class, so use the write-class job.
+  begin
+    insert into jobs (owner_id, project_id, job_type, idempotency_key, is_demo)
+    values (owner_a, p_id, 'research_topic', 'selftest:lease:paused', true)
+    returning id into j_reap;
+
+    perform set_config('omnios.claimant_agent_id', '', true);
+    lease_b := os_claim_next_job(ag_id, 60, owner_a);
+
+    perform set_config('omnios.actor_type', 'user', true);
+    perform os_set_emergency_pause(true, 'selftest — mid-flight cancellation');
+    perform set_config('omnios.actor_type', 'system', true);
+
+    perform os_heartbeat_job(lease_b.id, ag_id, 60);
+    test := '40 emergency pause refuses the heartbeat of running write work';
+    passed := false; detail := 'FAIL: a paused system renewed a write-class lease'; return next;
+  exception when others then
+    test := '40 emergency pause refuses the heartbeat of running write work';
+    passed := sqlerrm like '%EMERGENCY_PAUSE%';
+    detail := left(sqlerrm, 130); return next;
+  end;
+
+  -- ============ 41. read-class work keeps its lease while paused ============
+  -- A pause that blinds you is a bad pause; observation continues.
+  begin
+    exp_2 := os_heartbeat_job(j_lease, ag_id, 60);
+    test := '41 read-class work still heartbeats while paused';
+    passed := (exp_2 is not null);
+    detail := format('read-class lease renewed to %s during the pause', exp_2); return next;
+  exception when others then
+    test := '41 read-class work still heartbeats while paused';
+    passed := false; detail := 'FAIL: ' || sqlerrm; return next;
+  end;
+
+  perform set_config('omnios.actor_type', 'user', true);
+  perform os_set_emergency_pause(false, 'selftest — releasing');
+  perform set_config('omnios.actor_type', 'system', true);
+
+  -- ============ 42. an abandoned job is reaped and requeued ============
+  begin
+    update jobs set lease_expires_at = now() - interval '1 minute' where id = j_lease;
+    select attempt_count into n from jobs where id = j_lease;
+    perform os_reap_expired_leases();
+
+    test := '42 an abandoned lease is reaped and the job requeued';
+    select count(*) into n from jobs
+     where id = j_lease and status = 'queued'
+       and leased_by is null and lease_expires_at is null
+       and error_summary like 'OMNIOS_LEASE_EXPIRED%';
+    passed := (n = 1);
+    detail := case when n = 1 then 'job returned to the queue with the lapse recorded'
+                   else 'FAIL: job was not recovered' end;
+    return next;
+  exception when others then
+    test := '42 an abandoned lease is reaped and the job requeued';
+    passed := false; detail := 'FAIL: ' || sqlerrm; return next;
+  end;
+
+  -- ============ 43. the reaper respects the retry limit ============
+  -- A job abandoned over and over must eventually stop, not loop.
+  begin
+    update jobs set attempt_count = max_attempts where id = j_lease;
+    perform set_config('omnios.claimant_agent_id', '', true);
+    lease_b := os_claim_next_job(ag_id, 60, owner_a);
+    update jobs set lease_expires_at = now() - interval '1 minute' where id = j_lease;
+    perform os_reap_expired_leases();
+
+    test := '43 a repeatedly abandoned job stops instead of looping';
+    select count(*) into n from jobs where id = j_lease and status = 'failed';
+    passed := (n = 1);
+    detail := case when n = 1 then 'exhausted job left failed, not requeued'
+                   else 'FAIL: job was requeued past its retry limit' end;
+    return next;
+  exception when others then
+    test := '43 a repeatedly abandoned job stops instead of looping';
+    passed := false; detail := 'FAIL: ' || sqlerrm; return next;
+  end;
+
+  -- ============ 44. claiming respects the agent grant ============
+  -- The rival is granted read_source and research_topic but not
+  -- send_message, so it must never be handed one.
+  begin
+    insert into jobs (owner_id, project_id, job_type, idempotency_key, is_demo)
+    values (owner_a, p_id, 'send_message', 'selftest:lease:ungranted', true);
+
+    perform set_config('omnios.claimant_agent_id', '', true);
+    lease_b := os_claim_next_job(ag_rival, 60, owner_a);
+
+    test := '44 claim never hands an agent work it was not granted';
+    passed := (lease_b.id is null or lease_b.job_type <> 'send_message');
+    detail := coalesce('received ' || lease_b.job_type, 'received nothing, correct');
+    return next;
+  exception when others then
+    test := '44 claim never hands an agent work it was not granted';
+    passed := false; detail := 'FAIL: ' || sqlerrm; return next;
+  end;
+
+  perform set_config('omnios.claimant_agent_id', '', true);
+
   -- ---------- cleanup ----------
   perform set_config('request.jwt.claims', '', true);
   perform set_config('request.headers', '', true);
   perform set_config('omnios.actor_type', 'user', true);
   delete from approvals where project_id = p_id;
   delete from projects where slug in ('selftest-project', 'selftest-other');
-  delete from agents where name = 'selftest-runner';
+  delete from agents where name in ('selftest-runner', 'selftest-rival');
 
   -- ============ 29. deleting a project does not break history ======
   -- Regression test for the FK that made Postgres try to UPDATE

@@ -102,6 +102,21 @@ These steps use the repository's migration and seed scripts. They create a demo 
 | `npm run resume` | Releases the emergency pause. | `SUPABASE_DB_URL` |
 | `npm run dashboard` | Starts the Next.js dashboard development server on port 3100. | dashboard public variables |
 
+### Building the dashboard
+
+Build it from inside its own directory, not from the repo root:
+
+```bash
+cd apps/dashboard && npx next build
+```
+
+Tailwind's PostCSS plugin resolves `tailwind.config.ts` relative to the
+working directory. Running `next build apps/dashboard` from the root finds
+no config there, silently falls back to an empty one, and emits a
+stylesheet roughly a third of the correct size — the app builds and runs,
+it just renders almost unstyled. The only visible symptom is a
+`content option ... is missing or empty` warning in the build log.
+
 ## Verification status
 
 **Verified:** `npx vitest run` reports 58/58 TypeScript unit tests passing across policy, workspace-boundary, redaction, and adapter tests. The final database guard run reports 30/30 passing against the migrated Supabase project; it covers prohibited actions, job transitions, approval identity, pause behavior, append-only audit history, policy promotion, expiry, retries, idempotency, RLS, actor attribution, and project-deletion history retention.
