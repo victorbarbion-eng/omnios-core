@@ -656,6 +656,105 @@ begin
     passed := false; detail := 'FAIL: ' || sqlerrm; return next;
   end;
 
+  -- =====================================================================
+  -- 0012 — targeted claim, and lease ownership over PostgREST.
+  -- Tests 34-44 all ran with the claimant GUC set, which is the direct
+  -- database session path. A real worker talks through PostgREST, where
+  -- every request is its own transaction and that GUC is always empty.
+  -- These cover that path, because it is the one the runner uses.
+  -- =====================================================================
+
+  perform set_config('omnios.claimant_agent_id', '', true);
+
+  insert into jobs (owner_id, project_id, job_type, idempotency_key, is_demo)
+  values (owner_a, p_id, 'read_source', 'selftest:lease:named', true)
+  returning id into j_reap;
+
+  -- ============ 45. a named job can be claimed atomically ============
+  begin
+    lease_a := os_claim_job(j_reap, ag_id, 60);
+    test := '45 os_claim_job claims the job it was asked for';
+    passed := (lease_a.id = j_reap
+               and lease_a.status = 'claimed'
+               and lease_a.leased_by = ag_id
+               and lease_a.lease_expires_at > now());
+    detail := format('named job %s leased by %s', left(j_reap::text, 8), left(ag_id::text, 8));
+    return next;
+  exception when others then
+    test := '45 os_claim_job claims the job it was asked for';
+    passed := false; detail := 'FAIL: ' || sqlerrm; return next;
+  end;
+
+  -- ============ 46. a rival gets nothing, rather than the job ============
+  begin
+    lease_b := os_claim_job(j_reap, ag_rival, 60);
+    test := '46 os_claim_job refuses a job another agent already holds';
+    passed := (lease_b.id is null);
+    detail := case when lease_b.id is null
+                   then 'rival received null, correct'
+                   else 'FAIL: rival was handed a leased job' end;
+    return next;
+  exception when others then
+    test := '46 os_claim_job refuses a job another agent already holds';
+    passed := false; detail := 'FAIL: ' || sqlerrm; return next;
+  end;
+
+  -- ============ 47. the holder is recognised by name, no GUC ============
+  -- This is the PostgREST path. Clear the claimant GUC entirely and
+  -- identify only by the actor name the runner already sends in
+  -- x-omnios-actor-name. Before 0012 this refused the lease holder's own
+  -- job, which made leasing unusable from the runner.
+  begin
+    perform set_config('omnios.claimant_agent_id', '', true);
+    perform set_config('omnios.actor_name', '', true);
+    -- Exactly what PostgREST presents: no GUCs at all, only the headers
+    -- the runner attaches in createAgentClient().
+    perform set_config('request.headers',
+      '{"x-omnios-actor":"agent","x-omnios-actor-name":"selftest-runner"}', true);
+    update jobs set status = 'running' where id = j_reap;
+    perform set_config('request.headers', '', true);
+
+    test := '47 lease holder recognised by actor name alone (PostgREST path)';
+    select count(*) into n from jobs where id = j_reap and status = 'running';
+    passed := (n = 1);
+    detail := format('running=%s with no claimant GUC set', n);
+    return next;
+  exception when others then
+    test := '47 lease holder recognised by actor name alone (PostgREST path)';
+    passed := false; detail := 'FAIL: ' || sqlerrm; return next;
+  end;
+
+  -- ============ 48. a different name is still refused ============
+  -- The name resolves ownership; it must not wave everyone through.
+  begin
+    perform set_config('omnios.claimant_agent_id', '', true);
+    perform set_config('omnios.actor_name', 'selftest-rival', true);
+    update jobs set status = 'completed' where id = j_reap;
+
+    test := '48 a different actor name cannot advance the leased job';
+    passed := false; detail := 'FAIL: the rival name was accepted'; return next;
+  exception when others then
+    test := '48 a different actor name cannot advance the leased job';
+    passed := sqlerrm like 'OMNIOS_LEASE_HELD%';
+    detail := left(sqlerrm, 120); return next;
+  end;
+
+  -- ============ 49. an unnamed caller is refused too ============
+  -- No GUC, no name: the guard must default to refusing, not allowing.
+  begin
+    perform set_config('omnios.claimant_agent_id', '', true);
+    perform set_config('omnios.actor_name', '', true);
+    update jobs set status = 'completed' where id = j_reap;
+
+    test := '49 an unidentified caller cannot advance a leased job';
+    passed := false; detail := 'FAIL: an anonymous caller was accepted'; return next;
+  exception when others then
+    test := '49 an unidentified caller cannot advance a leased job';
+    passed := sqlerrm like 'OMNIOS_LEASE_HELD%';
+    detail := left(sqlerrm, 120); return next;
+  end;
+
+  perform set_config('omnios.actor_name', 'cli', true);
   perform set_config('omnios.claimant_agent_id', '', true);
 
   -- ---------- cleanup ----------

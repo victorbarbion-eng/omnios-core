@@ -20,6 +20,18 @@ export class PolicyRefusal extends Error {
 }
 
 /**
+ * Thrown when the database has refused to renew this runner's lease and
+ * the workflow tried to take another step anyway. Distinct from
+ * PolicyRefusal: nothing was disallowed, the system was told to stop.
+ */
+export class CancelledError extends Error {
+  constructor(reason: string) {
+    super(`OMNIOS_CANCELLED: the database refused to renew this job's lease, so work stopped. ${reason}`);
+    this.name = 'CancelledError';
+  }
+}
+
+/**
  * The local agent runner.
  *
  * Small on purpose: it is a disciplined client of the database, not an
@@ -32,6 +44,29 @@ export class Runner {
   private agentId: string | null = null;
   private allowedActions: string[] = [];
   private paused = false;
+
+  /**
+   * Lease state (migrations 0011 / 0012).
+   *
+   * A claimed job carries a lease that lapses unless this runner keeps
+   * saying "still here". Two things follow from that:
+   *
+   *  - if this process dies mid-job, the lease lapses and
+   *    os_reap_expired_leases() returns the work to the queue instead of
+   *    leaving it stuck in `running` with nobody running it;
+   *  - the database can REFUSE a renewal, which is how a job already
+   *    running learns the emergency pause has been engaged. That refusal
+   *    is recorded here and checked before every later status change.
+   *
+   * Be precise about what that buys: the runner stops between steps, not
+   * mid-step. A long step still finishes. The honest claim is "the next
+   * thing will not happen", not "this is killed".
+   */
+  private lease: { jobId: string; timer: NodeJS.Timeout } | null = null;
+  private cancelRequested: string | null = null;
+
+  /** How long a claim is held before it must be renewed. */
+  private static readonly LEASE_SECONDS = 60;
 
   private constructor(
     private readonly db: SupabaseClient,
@@ -288,12 +323,105 @@ export class Runner {
       this.print(`[dry-run] would set job ${jobId} → ${status}`);
       return;
     }
+
+    // If a heartbeat has been refused, the only transitions still worth
+    // making are the ones that put the job down. Checking here rather
+    // than inside each workflow means a new workflow inherits the
+    // behaviour instead of having to remember it.
+    if (this.cancelRequested && !['failed', 'cancelled'].includes(status)) {
+      throw new CancelledError(this.cancelRequested);
+    }
+
     const { error } = await this.db.from('jobs').update({ status, ...patch }).eq('id', jobId);
     if (error) throw new Error(`Job ${jobId} → ${status} refused: ${error.message}`);
+
+    if (['completed', 'failed', 'cancelled', 'awaiting_approval'].includes(status)) {
+      this.releaseLease(jobId);
+    }
   }
 
+  /**
+   * Claim a job through the database rather than by writing `claimed`
+   * ourselves (migration 0012).
+   *
+   * The difference matters only when a second worker exists, which is
+   * exactly when it is too late to add it. os_claim_job() finds and
+   * locks the row in one statement, so two runners asking at the same
+   * instant cannot both be told yes — the loser gets null and moves on
+   * rather than quietly doing the same work twice.
+   */
   async claim(jobId: string): Promise<void> {
-    await this.setJobStatus(jobId, 'claimed');
+    if (this.env.dryRun) {
+      this.print(`[dry-run] would claim job ${jobId} with a ${Runner.LEASE_SECONDS}s lease`);
+      return;
+    }
+    if (!this.agentId) throw new Error('OMNIOS_NOT_REGISTERED: call register() before claiming work.');
+
+    const { data, error } = await this.db.rpc('os_claim_job', {
+      p_job_id: jobId,
+      p_agent_id: this.agentId,
+      p_lease_seconds: Runner.LEASE_SECONDS,
+    });
+    if (error) throw new Error(`Job ${jobId} claim refused: ${error.message}`);
+
+    if (!data) {
+      throw new Error(
+        `OMNIOS_CLAIM_REFUSED: job ${jobId} was not claimable. It is already leased by another worker, ` +
+          `is not queued, is not in this agent's allowed_actions, or the emergency pause is engaged.`,
+      );
+    }
+
+    this.cancelRequested = null;
+    this.startHeartbeat(jobId);
+  }
+
+  /**
+   * Renew the lease on a timer at a third of its length, so two
+   * consecutive failures still leave time to recover before it lapses.
+   */
+  private startHeartbeat(jobId: string): void {
+    this.releaseLease();
+    const everyMs = Math.max(5, Math.floor(Runner.LEASE_SECONDS / 3)) * 1000;
+
+    const timer = setInterval(() => {
+      void this.db
+        .rpc('os_heartbeat_job', {
+          p_job_id: jobId,
+          p_agent_id: this.agentId,
+          p_lease_seconds: Runner.LEASE_SECONDS,
+        })
+        .then(({ error }) => {
+          if (!error) return;
+          // A refused renewal is a message, not a glitch. The usual
+          // sender is the emergency pause.
+          this.cancelRequested = error.message;
+          this.print(`  [stop] lease renewal refused: ${redact(error.message)}`);
+          this.releaseLease();
+        });
+    }, everyMs);
+
+    timer.unref?.();
+    this.lease = { jobId, timer };
+  }
+
+  private releaseLease(jobId?: string): void {
+    if (!this.lease) return;
+    if (jobId && this.lease.jobId !== jobId) return;
+    clearInterval(this.lease.timer);
+    this.lease = null;
+  }
+
+  /** True once the database has refused to renew this runner's lease. */
+  get isCancelled(): boolean {
+    return this.cancelRequested !== null;
+  }
+
+  /**
+   * Drop any lease and stop the timer. Call before exiting so a clean
+   * shutdown does not leave the event loop holding an interval.
+   */
+  shutdown(): void {
+    this.releaseLease();
   }
 
   async log(

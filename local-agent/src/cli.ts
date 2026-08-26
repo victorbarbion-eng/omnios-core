@@ -37,6 +37,32 @@ async function main(): Promise<void> {
   const runner = await Runner.create();
   const ownerId = await runner.resolveOwnerId();
 
+  // A claimed job holds a heartbeat timer. Always stop it, including on
+  // the error paths, so the process can exit instead of hanging on a
+  // live interval.
+  const stop = (): void => runner.shutdown();
+  process.once('SIGINT', () => {
+    stop();
+    process.exit(130);
+  });
+  process.once('SIGTERM', () => {
+    stop();
+    process.exit(143);
+  });
+
+  try {
+    await dispatch(runner, ownerId, command, rest);
+  } finally {
+    stop();
+  }
+}
+
+async function dispatch(
+  runner: Runner,
+  ownerId: string,
+  command: string,
+  rest: string[],
+): Promise<void> {
   if (runner.isDryRun) {
     console.log('▸ DRY RUN — no database writes will be made.\n');
   }
