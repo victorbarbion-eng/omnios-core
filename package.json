@@ -26,7 +26,8 @@
     "agent:refusals": "tsx local-agent/src/cli.ts refusals",
     "pause": "tsx scripts/pause.ts",
     "resume": "tsx scripts/pause.ts --off",
-    "dashboard": "npm run dev --workspace apps/dashboard"
+    "dashboard": "npm run dev --workspace apps/dashboard",
+    "db:guards": "tsx scripts/guards.ts"
   },
   "devDependencies": {
     "@types/node": "^22.10.2",
