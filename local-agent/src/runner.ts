@@ -384,24 +384,41 @@ export class Runner {
     const everyMs = Math.max(5, Math.floor(Runner.LEASE_SECONDS / 3)) * 1000;
 
     const timer = setInterval(() => {
-      void this.db
-        .rpc('os_heartbeat_job', {
-          p_job_id: jobId,
-          p_agent_id: this.agentId,
-          p_lease_seconds: Runner.LEASE_SECONDS,
-        })
-        .then(({ error }) => {
-          if (!error) return;
-          // A refused renewal is a message, not a glitch. The usual
-          // sender is the emergency pause.
-          this.cancelRequested = error.message;
-          this.print(`  [stop] lease renewal refused: ${redact(error.message)}`);
-          this.releaseLease();
-        });
+      void this.renewLease(jobId).catch((err: unknown) => {
+        // A refused renewal is a message, not a glitch. The usual
+        // sender is the emergency pause.
+        const reason = (err as Error).message;
+        this.cancelRequested = reason;
+        this.print(`  [stop] lease renewal refused: ${redact(reason)}`);
+        this.releaseLease();
+      });
     }, everyMs);
 
     timer.unref?.();
     this.lease = { jobId, timer };
+  }
+
+  /**
+   * Renew the lease once. Throws when the database refuses, which is a
+   * deliberate signal and not a transport failure — see os_heartbeat_job.
+   * Public so a foreground check can show each renewal happening.
+   */
+  async renewLease(jobId: string, leaseSeconds = Runner.LEASE_SECONDS): Promise<Date> {
+    if (!this.agentId) throw new Error('OMNIOS_NOT_REGISTERED: no agent id to renew a lease with.');
+    const { data, error } = await this.db.rpc('os_heartbeat_job', {
+      p_job_id: jobId,
+      p_agent_id: this.agentId,
+      p_lease_seconds: leaseSeconds,
+    });
+    if (error) throw new Error(error.message);
+    return new Date(data as string);
+  }
+
+  /** Current status of one job, read back from the database. */
+  async jobStatus(jobId: string): Promise<JobStatus> {
+    const { data, error } = await this.db.from('jobs').select('status').eq('id', jobId).single();
+    if (error) throw new Error(error.message);
+    return data.status as JobStatus;
   }
 
   private releaseLease(jobId?: string): void {

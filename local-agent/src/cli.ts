@@ -14,6 +14,7 @@
  */
 import { Runner } from './runner.js';
 import { runResearchToApprovalDemo, demonstrateRefusals } from './workflows/research-to-approval.js';
+import { runLeaseCheck } from './leasecheck.js';
 
 const DEFAULT_ALLOWED = [
   'read_source',
@@ -103,6 +104,12 @@ async function dispatch(
       break;
     }
 
+    case 'leasecheck': {
+      await runner.register(ownerId, DEFAULT_ALLOWED);
+      await runLeaseCheck(runner, ownerId);
+      break;
+    }
+
     case 'check': {
       const action = rest[0];
       if (!action) {
@@ -125,7 +132,9 @@ async function dispatch(
     }
 
     default:
-      console.error(`Unknown command "${command}". Try: status | register | run-demo | refusals | check | approvals`);
+      console.error(
+        `Unknown command "${command}". Try: status | register | run-demo | refusals | leasecheck | check | approvals`,
+      );
       process.exitCode = 1;
   }
 }
