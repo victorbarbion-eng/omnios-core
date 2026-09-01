@@ -35,6 +35,8 @@ declare
   lease_b  jobs;
   exp_1    timestamptz;
   exp_2    timestamptz;
+  j_bind   uuid;
+  ap_bind  uuid;
 begin
   -- ---------- fixtures ----------
   delete from projects where slug in ('selftest-project', 'selftest-other');
@@ -756,6 +758,132 @@ begin
 
   perform set_config('omnios.actor_name', 'cli', true);
   perform set_config('omnios.claimant_agent_id', '', true);
+
+  -- =====================================================================
+  -- 0013 — an approval authorises CONTENT, not a job id.
+  --
+  -- Before 0013 the gate asked "is there an approved approval for this
+  -- job id?" and never asked whether the job still held what the human
+  -- read. Tests 50-53 cover both layers of the fix: the freeze (you may
+  -- not edit the question while it is being answered) and the digest
+  -- (the answer is attached to specific content).
+  -- =====================================================================
+
+  insert into jobs (owner_id, project_id, agent_id, job_type, input_reference, idempotency_key, is_demo)
+  values (owner_a, p_id, ag_id, 'send_message',
+          '{"to": "consultant@example.com", "body": "the thing you approved"}'::jsonb,
+          'selftest:bind', true)
+  returning id into j_bind;
+
+  update jobs set status = 'claimed' where id = j_bind;
+  update jobs set status = 'awaiting_approval' where id = j_bind;
+
+  insert into approvals (owner_id, project_id, job_id, action_type, action_preview, target_reference, is_demo)
+  values (owner_a, p_id, j_bind, 'send_message',
+          'Send the brief to consultant@example.com', 'outlook:consultant@example.com', true)
+  returning id into ap_bind;
+
+  -- ============ 50. requesting an approval records the payload ======
+  begin
+    test := '50 approval records a digest of the payload it was asked about';
+    select count(*) into n from approvals
+     where id = ap_bind
+       and approved_payload_digest = os_payload_digest(
+             (select input_reference from jobs where id = j_bind));
+    passed := (n = 1);
+    detail := case when n = 1 then 'digest matches the job payload at request time'
+                   else 'FAIL: no digest recorded' end;
+    return next;
+  exception when others then
+    test := '50 approval records a digest of the payload it was asked about';
+    passed := false; detail := 'FAIL: ' || sqlerrm; return next;
+  end;
+
+  -- ============ 51. the payload freezes while a decision is open ====
+  begin
+    update jobs
+       set input_reference = '{"to": "attacker@example.com", "body": "not what you read"}'::jsonb
+     where id = j_bind;
+    test := '51 payload cannot change while an approval is pending';
+    passed := false; detail := 'FAIL: the job payload was edited mid-decision'; return next;
+  exception when others then
+    test := '51 payload cannot change while an approval is pending';
+    passed := sqlerrm like 'OMNIOS_PAYLOAD_FROZEN%';
+    detail := left(sqlerrm, 130); return next;
+  end;
+
+  -- Grant the approval OUTSIDE any block that expects an exception.
+  -- A plpgsql begin/exception block rolls back everything it did, so an
+  -- approval granted inside the block below would be silently undone and
+  -- tests 53-54 would fail on a missing approval rather than on the
+  -- thing they exist to test. (It cost a debugging round to notice.)
+  perform set_config('request.jwt.claims',
+    json_build_object('sub', owner_a, 'role', 'authenticated')::text, true);
+  update approvals set status = 'approved', decision_note = 'selftest — bind' where id = ap_bind;
+  perform set_config('request.jwt.claims', '', true);
+  perform set_config('omnios.actor_type', 'system', true);
+
+  -- ============ 52. still frozen AFTER approval is granted ==========
+  begin
+    update jobs
+       set input_reference = '{"to": "attacker@example.com"}'::jsonb
+     where id = j_bind;
+    test := '52 payload cannot change after approval is granted';
+    passed := false; detail := 'FAIL: an approved job was edited before running'; return next;
+  exception when others then
+    test := '52 payload cannot change after approval is granted';
+    passed := sqlerrm like 'OMNIOS_PAYLOAD_FROZEN%';
+    detail := left(sqlerrm, 130); return next;
+  end;
+
+  -- ============ 53. the digest still catches it if the freeze is gone ==
+  -- Defence in depth is only worth claiming if the second layer is shown
+  -- to work WITHOUT the first. Disable the freeze, make exactly the swap
+  -- an attacker would make, and confirm execution is still refused.
+  begin
+    alter table jobs disable trigger jobs_freeze_payload;
+    update jobs
+       set input_reference = '{"to": "attacker@example.com", "body": "not what you read"}'::jsonb
+     where id = j_bind;
+    alter table jobs enable trigger jobs_freeze_payload;
+
+    update jobs set status = 'running' where id = j_bind;
+
+    test := '53 a swapped payload is refused at execution even with the freeze off';
+    passed := false; detail := 'FAIL: a job ran with content nobody approved'; return next;
+  exception when others then
+    begin
+      alter table jobs enable trigger jobs_freeze_payload;
+    exception when others then null;
+    end;
+    test := '53 a swapped payload is refused at execution even with the freeze off';
+    passed := sqlerrm like 'OMNIOS_PAYLOAD_CHANGED%';
+    detail := left(sqlerrm, 140); return next;
+  end;
+
+  -- ============ 54. an approval with no digest cannot authorise ======
+  -- Approvals granted before 0013 have no binding, so they cannot be
+  -- shown to authorise any particular content. Fail closed.
+  begin
+    update approvals set approved_payload_digest = null where id = ap_bind;
+    alter table jobs disable trigger jobs_freeze_payload;
+    update jobs set input_reference =
+      '{"to": "consultant@example.com", "body": "the thing you approved"}'::jsonb
+     where id = j_bind;
+    alter table jobs enable trigger jobs_freeze_payload;
+
+    update jobs set status = 'running' where id = j_bind;
+    test := '54 a pre-0013 approval with no digest is refused';
+    passed := false; detail := 'FAIL: an unbound approval authorised execution'; return next;
+  exception when others then
+    begin
+      alter table jobs enable trigger jobs_freeze_payload;
+    exception when others then null;
+    end;
+    test := '54 a pre-0013 approval with no digest is refused';
+    passed := sqlerrm like 'OMNIOS_APPROVAL_UNBOUND%';
+    detail := left(sqlerrm, 140); return next;
+  end;
 
   -- ---------- cleanup ----------
   perform set_config('request.jwt.claims', '', true);
