@@ -16,7 +16,13 @@ This document is intentionally conservative. It separates implemented controls f
 - **It stops deletion, not destruction.** An agent with the service-role key can still blank an artifact's body or rename a project to nonsense: a legitimate update and a vandalising one are the same statement, and no predicate separates them. Closing that needs the narrow-role rebuild — agents reaching tables only through `SECURITY DEFINER` functions, with no direct table grants at all. `0015` is the cheap ninety per cent and should not be mistaken for the whole thing.
 - ~~Nothing limits volume.~~ **Partly resolved by migration `0014_volume_limits.sql`.** A `usage_budgets` table caps job creation per owner, per day, per risk class, enforced on insert; `max_concurrent_jobs` is finally read, scoped per agent, so a worker at capacity is handed nothing more. Guard tests 55–58. Two honest caveats: the defaults (500 read / 200 internal_write / 50 external_draft / 20 approval_required per day) are starting numbers rather than researched ones, and a limit that fires during ordinary work trains you to raise it without reading — the approval-fatigue failure in a different hat. And the budget counts JOBS, not money or tokens; a cost ceiling is a separate thing that does not exist.
 - Demo and test rows (`is_demo = true`) are exempt from the budget, so the guard suite can run repeatedly without exhausting a real allowance. That exemption is also a hole: anything that can set `is_demo` can create unlimited jobs. Acceptable while the only writers are the runner and the MCP server, neither of which sets it on real work; not acceptable once anything less trusted can write.
-- **Approving requires being at the Mac with a dev server running.** The design is explicit that approval fatigue — clicking yes on autopilot — is how these systems fail in practice. Making a decision inconvenient reintroduces exactly that failure through the user experience rather than through the schema. Not a database problem, which is why it is easy to leave undone.
+- ~~**Approving requires being at the Mac with a dev server running.**~~ **Prepared, not yet done.** The design is explicit that approval fatigue — clicking yes on autopilot — is how these systems fail in practice, and making a decision inconvenient reintroduces that failure through the user experience rather than through the schema. `docs/deploying-the-dashboard.md` is the procedure, and the code it depends on has landed: the sign-in allowlist (`0016`), the open-redirect fix in the `next=` parameter, and `frame-ancestors 'none'`. What remains is the deployment itself, which only the owner can do. Until a URL exists this is still a limitation, not a resolved item.
+
+  Worth recording why the tempting shortcut was refused. A one-click **Approve** link in an email would mean a service holding a credential and turning a click into a decision, which the database would then have to accept as a human. That makes `auth.uid()` — the single line every guard here reduces to — decoration. The sign-in stays; the laptop goes.
+- **The service-role key can become you.** Supabase's Auth admin API (`POST /auth/v1/admin/users`) accepts the service-role key, and an agent holds that key. Migration `0016_signin_allowlist.sql` closes the account-*creation* half: a trigger on `auth.users` refuses any email absent from `public.auth_allowlist`, which binds self-signup with the publishable key and the admin API with the service-role key alike, because both end at the same insert. The allowlist is unreachable over the API by three overlapping controls — revoked privileges, RLS with no policies, and a trigger refusing API-channel writes — because a table that decides who counts as a person must not be writable by anything holding a key. Guard tests 65–70, with 70 proving the empty-allowlist bootstrap exemption closes behind the first account instead of staying open.
+
+  The account-*modification* half is not closed and cannot be closed at this layer: the same admin API resets any user's password, and no trigger can distinguish that call from your own password recovery — both reach Postgres as `supabase_auth_admin`, with no session and no request headers. This is now the sharpest argument for the narrow-role rebuild below, which until now was justified on tidiness grounds.
+- The dashboard's `next=` redirect parameter accepted anything beginning with `/`, including `//host` and `/\host`, which browsers read as protocol-relative URLs and follow off-site. Fixed in `apps/dashboard/src/lib/safe-next.ts`, with unit tests for each bypass. Harmless while the console only ran on localhost; on a public domain it is a link that carries your real domain, walks a victim through a real successful sign-in, and lands them somewhere else. Recorded because the defect did not change — its context did.
 - Approvals expire when `os_expire_stale_approvals()` is called, but nothing automatically re-requests an expired approval.
 - The supplied local runner is a fixed demo runner, not a general queue consumer. It does not poll queued jobs, enforce a worker concurrency limit, or implement a general retry loop.
 - `agents.allowed_actions`, `allowed_project_scope` and the `paused` off switch are now enforced in the database by `os_guard_agent_grant()` (migrations `0009` and `0010`), not only by the TypeScript `PolicyEngine`. A client holding the service-role key cannot queue a job type its agent record does not permit. Note that `offline` is deliberately not a block: a laptop is offline most of the time and queued work simply waits for it.
@@ -44,24 +50,29 @@ The passing guard suite is meaningful because it found defects in the enforcemen
 
 ## Three highest-value next improvements
 
-The previous three are done: atomic leasing (`0011`/`0012`), a live
-service-role-backed end-to-end run, and payload binding (`0013`). What
-replaces them, in order:
+Volume limits (`0014`) and "agents cannot destroy" (`0015`) are done, and
+getting approvals off the Mac is prepared and waiting on a deployment
+(`docs/deploying-the-dashboard.md`). What is left, in order:
 
-1. **Give agents a narrow database role.** Today an agent holds
-   service-role, which bypasses row-level security. It cannot act
-   wrongly — the guards see to that — but it can delete everything. Move
-   agents onto their own role with `SECURITY DEFINER` entry points and
-   "cannot destroy" becomes structural rather than trusted. This is the
-   natural next step of the project's own thesis.
-2. **Add volume limits.** A per-day budget per risk class, enforced in
-   the same trigger that already checks everything else, plus actually
-   reading `max_concurrent_jobs`. Approvals stop one bad action; nothing
-   currently stops ten thousand permitted ones.
-3. **Get approvals off the Mac.** The design names approval fatigue as
-   the real-world failure mode, and then makes deciding require a
-   laptop and a dev server. A notification with an approve link would
-   close the gap the schema cannot reach.
+1. **Give agents a narrow database role.** This was already number one.
+   It is now number one for a much sharper reason than tidiness: an
+   agent holds `service_role`, and `service_role` is the credential
+   Supabase's Auth admin API accepts. That API can reset any user's
+   password, so today the agent's key can make itself into you, and
+   `auth.uid()` — the line every guard in this project rests on — stops
+   being a boundary the key cannot cross. `0016` closes account
+   creation; only moving agents off `service_role` closes the rest.
+   Give them their own role with `SECURITY DEFINER` entry points and no
+   direct table grants, and "cannot approve", "cannot destroy" and
+   "cannot become the owner" all become structural at once.
+2. **Deploy the console and decide something real on a phone.**
+   Everything is ready; the remaining step needs an owner, not a
+   builder. Until it happens, approval fatigue is still being designed
+   in through the user experience.
+3. **Put a ceiling on cost, not just on count.** `usage_budgets` limits
+   how many jobs are created per day per risk class. It says nothing
+   about tokens, money, or time. A runaway loop that stays inside its
+   job budget can still be expensive, and nothing currently notices.
 
 Still true and still deliberate: the five integration adapters are
 inert, the demo research step reads a fixed source set, and nothing is

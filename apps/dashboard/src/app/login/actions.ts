@@ -2,11 +2,12 @@
 
 import { redirect } from 'next/navigation';
 import { createClient } from '@/lib/supabase/server';
+import { safeNext } from '@/lib/safe-next';
 
 export async function signIn(formData: FormData): Promise<void> {
   const email = String(formData.get('email') ?? '');
   const password = String(formData.get('password') ?? '');
-  const next = String(formData.get('next') ?? '/') || '/';
+  const next = safeNext(String(formData.get('next') ?? '/'));
 
   const supabase = await createClient();
   const { error } = await supabase.auth.signInWithPassword({ email, password });
@@ -16,7 +17,7 @@ export async function signIn(formData: FormData): Promise<void> {
     redirect(`/login?error=${encodeURIComponent(error.message)}`);
   }
 
-  redirect(next.startsWith('/') ? next : '/');
+  redirect(next);
 }
 
 export async function signOut(): Promise<void> {

@@ -1,5 +1,6 @@
 import Link from 'next/link';
 import { signIn } from './actions';
+import { safeNext } from '@/lib/safe-next';
 
 export const metadata = { title: 'Sign in — OmniOS' };
 
@@ -35,7 +36,9 @@ export default async function LoginPage({
       ) : null}
 
       <form action={signIn} className="mt-5 space-y-3 border border-line bg-panel p-4">
-        <input type="hidden" name="next" value={next ?? '/'} />
+        {/* Sanitised here as well as in the action: the value is attacker-
+            supplied twice over, once in the URL and once in this field. */}
+        <input type="hidden" name="next" value={safeNext(next)} />
         <label className="block">
           <span className="font-mono text-2xs uppercase tracking-wider text-dimmer">email</span>
           <input

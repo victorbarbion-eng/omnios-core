@@ -119,7 +119,7 @@ it just renders almost unstyled. The only visible symptom is a
 
 ## Verification status
 
-**Verified:** `npx vitest run` reports 58/58 TypeScript unit tests. `npm run db:guards` reports **49/49** against the live Supabase project, covering prohibited actions, job transitions, approval identity, pause behaviour, append-only audit history, policy promotion, expiry, retries, idempotency, RLS, actor attribution, project-deletion history retention, and — from `0011`/`0012` — atomic claiming, lease ownership over both the direct-session and PostgREST paths, mid-flight pause cancellation, and lease reaping. `tests/concurrent_claim.sh` proves the claim race separately with eight real concurrent connections, which a single-transaction test function structurally cannot do.
+**Verified:** `npx vitest run` reports 74/74 TypeScript unit tests. `npm run db:guards` reports **70/70** against the live Supabase project, covering prohibited actions, job transitions, approval identity, pause behaviour, append-only audit history, policy promotion, expiry, retries, idempotency, RLS, actor attribution, project-deletion history retention, and — from `0011` through `0016` — atomic claiming, lease ownership over both the direct-session and PostgREST paths, mid-flight pause cancellation, lease reaping, approval-to-payload binding, daily volume budgets, refusal of agent deletion and of ownership reassignment, and the sign-in allowlist that stops anything holding a key from minting itself a human session. `tests/concurrent_claim.sh` proves the claim race separately with eight real concurrent connections, which a single-transaction test function structurally cannot do.
 
 Verified live by the owner, not by the builder:
 
@@ -127,7 +127,7 @@ Verified live by the owner, not by the builder:
 - The dashboard's signed-in views rendering live data.
 - `npm run agent:leasecheck` — 41 lease renewals, then the emergency pause refusing the 42nd and the runner stopping a job that was already running.
 
-**Not yet verified:** no Vercel deployment has been made. The five integration adapters remain inert by design (`OMNIOS_ADAPTER_DISABLED`). `max_concurrent_jobs` is stored and still not read. See `docs/known-limitations.md`, which is kept deliberately conservative.
+**Not yet verified:** no Vercel deployment has been made — the procedure and the code it depends on are ready in [Deploying the dashboard](docs/deploying-the-dashboard.md), but until a URL exists, approving still requires the Mac. The five integration adapters remain inert by design (`OMNIOS_ADAPTER_DISABLED`). See `docs/known-limitations.md`, which is kept deliberately conservative — including the entry explaining that the service-role key can still reset your password through Supabase's Auth admin API and sign in as you.
 
 ## Read next
 
@@ -135,5 +135,6 @@ Verified live by the owner, not by the builder:
 - [Security and secrets](docs/security-and-secrets.md)
 - [Approval policy](docs/approval-policy.md)
 - [Operations runbook](docs/operations-runbook.md)
+- [Deploying the dashboard](docs/deploying-the-dashboard.md)
 - [Data model](docs/data-model.md)
 - [Known limitations](docs/known-limitations.md)

@@ -1097,6 +1097,171 @@ begin
   perform set_config('request.headers', '', true);
   perform set_config('omnios.actor_type', 'user', true);
 
+  -- ============ 65-69. who is allowed to become a human ============
+  -- Every guard in this system reduces to `auth.uid() is not null`.
+  -- Migration 0016 asks the question one level lower: who is allowed to
+  -- HAVE an auth.uid() at all. These check that the answer is enforced
+  -- rather than assumed.
+
+  -- 65. The trigger is really on auth.users.
+  -- 0016 installs it inside an exception handler so a permissions
+  -- problem on the auth schema cannot abort the whole migration. That
+  -- makes this test the thing that tells the truth: if the trigger is
+  -- missing, the allowlist table exists and enforces nothing.
+  test := '65 the sign-up allowlist trigger is installed on auth.users';
+  select count(*) into n
+    from pg_trigger t
+    join pg_class c on c.oid = t.tgrelid
+    join pg_namespace ns on ns.oid = c.relnamespace
+   where ns.nspname = 'auth' and c.relname = 'users'
+     and t.tgname = 'users_signup_allowlist' and not t.tgisinternal;
+  passed := (n = 1);
+  detail := case when n = 1
+                 then 'present; self-signup and the Auth admin API both pass through it'
+                 else 'MISSING: migration 0016 warned instead of failing. Nothing restricts account creation.'
+            end;
+  return next;
+
+  -- An anchor row, so 66 tests the allowlist rather than the bootstrap
+  -- exemption. Without it the suite passes on a live project (where the
+  -- owner's address was seeded) and fails on an empty one, which would
+  -- make the test a statement about the fixture instead of the guard.
+  insert into auth_allowlist (email, note)
+  values ('selftest-anchor@omnios.invalid', 'guard suite: keeps the bootstrap exemption out of play')
+  on conflict (email) do nothing;
+
+  -- 66. An address nobody allowlisted cannot become an account.
+  -- This is the path the Auth admin API takes with the service-role
+  -- key, and the path self-signup takes with the publishable key.
+  begin
+    insert into auth.users (id, email)
+    values (gen_random_uuid(), 'selftest-intruder@omnios.invalid');
+
+    delete from auth.users where email = 'selftest-intruder@omnios.invalid';
+    test := '66 an email that is not allowlisted cannot become an account';
+    passed := false;
+    detail := 'FAIL: an arbitrary account was created. Anything holding a key can mint itself a human session.';
+    return next;
+  exception when others then
+    test := '66 an email that is not allowlisted cannot become an account';
+    passed := sqlerrm like 'OMNIOS_SIGNUP_REFUSED%';
+    detail := left(sqlerrm, 130); return next;
+  end;
+
+  -- 67. It is an allowlist, not a wall.
+  -- The insert is deliberately rolled back: a plpgsql exception block
+  -- is a subtransaction, so raising a sentinel after a successful
+  -- insert proves the insert was PERMITTED without leaving a real
+  -- account behind on the live project.
+  begin
+    insert into auth_allowlist (email, note)
+    values ('selftest-allowed@omnios.invalid', 'guard suite fixture');
+    begin
+      insert into auth.users (id, email)
+      values (gen_random_uuid(), 'selftest-allowed@omnios.invalid');
+      raise exception 'SELFTEST_ROLLBACK_OK';
+    exception when others then
+      test := '67 an allowlisted email is permitted';
+      if sqlerrm like 'SELFTEST_ROLLBACK_OK%' then
+        passed := true;
+        detail := 'accepted, then rolled back so no real account is created';
+      else
+        passed := false;
+        detail := 'FAIL: ' || left(sqlerrm, 130);
+      end if;
+      return next;
+    end;
+    delete from auth_allowlist where email = 'selftest-allowed@omnios.invalid';
+  exception when others then
+    test := '67 an allowlisted email is permitted';
+    passed := false; detail := 'FAIL: ' || left(sqlerrm, 130); return next;
+  end;
+
+  -- 68. The lock is not reachable by anything holding a key.
+  -- Supabase's default privileges grant every new table in public to
+  -- these three roles, so this passing means 0016's revoke actually ran
+  -- and nothing has re-granted since.
+  test := '68 no API role has any privilege on the allowlist';
+  select count(*) into n
+    from (values ('anon'), ('authenticated'), ('service_role')) r(role_name)
+   where has_table_privilege(r.role_name, 'public.auth_allowlist', 'SELECT')
+      or has_table_privilege(r.role_name, 'public.auth_allowlist', 'INSERT')
+      or has_table_privilege(r.role_name, 'public.auth_allowlist', 'UPDATE')
+      or has_table_privilege(r.role_name, 'public.auth_allowlist', 'DELETE');
+  passed := (n = 0);
+  detail := case when n = 0
+                 then 'anon, authenticated and service_role all have nothing'
+                 else format('%s of 3 API roles can reach the table that decides who is a person', n)
+            end;
+  return next;
+
+  -- 69. And even with a grant, the API channel is refused.
+  -- Belt and braces: if some future migration re-runs a blanket
+  -- `grant all on all tables in schema public`, test 68 goes red and
+  -- this trigger is what still holds the line.
+  begin
+    perform set_config('request.headers', '{"x-omnios-actor":"user"}', true);
+    insert into auth_allowlist (email, note)
+    values ('selftest-viaapi@omnios.invalid', 'should never land');
+
+    test := '69 the allowlist cannot be written over the API';
+    passed := false;
+    detail := 'FAIL: a request with API headers added an address. The key can let itself in.';
+    return next;
+  exception when others then
+    test := '69 the allowlist cannot be written over the API';
+    passed := sqlerrm like 'OMNIOS_ALLOWLIST_LOCAL_ONLY%';
+    detail := left(sqlerrm, 130); return next;
+  end;
+
+  perform set_config('request.headers', '', true);
+  perform set_config('omnios.actor_type', 'user', true);
+
+  -- 70. The bootstrap exemption exists, and closes behind itself.
+  -- An empty allowlist has to admit one account or a fresh project
+  -- could never have a first user. The danger is an exemption that
+  -- stays open. Everything here happens inside an exception block, so
+  -- emptying the table and creating an account are both rolled back —
+  -- the live project's real allowlist is untouched.
+  begin
+    delete from auth_allowlist;
+    insert into auth.users (id, email)
+    values (gen_random_uuid(), 'selftest-first@omnios.invalid');
+
+    select count(*) into n from auth_allowlist where email = 'selftest-first@omnios.invalid';
+    if n <> 1 then
+      raise exception 'SELFTEST_BOOTSTRAP_NOT_RECORDED';
+    end if;
+
+    -- The door should now be shut for everyone else.
+    begin
+      insert into auth.users (id, email)
+      values (gen_random_uuid(), 'selftest-second@omnios.invalid');
+      raise exception 'SELFTEST_BOOTSTRAP_STAYED_OPEN';
+    exception when others then
+      if sqlerrm like 'OMNIOS_SIGNUP_REFUSED%' then
+        raise exception 'SELFTEST_BOOTSTRAP_OK';
+      else
+        raise exception 'SELFTEST_BOOTSTRAP_BAD:%', sqlerrm;
+      end if;
+    end;
+  exception when others then
+    test := '70 an empty allowlist admits one account, then closes';
+    passed := sqlerrm like 'SELFTEST_BOOTSTRAP_OK%';
+    detail := case
+      when sqlerrm like 'SELFTEST_BOOTSTRAP_OK%'
+        then 'first account admitted and recorded; the second was refused'
+      when sqlerrm like 'SELFTEST_BOOTSTRAP_STAYED_OPEN%'
+        then 'FAIL: the exemption did not close. An emptied allowlist is an open door.'
+      when sqlerrm like 'SELFTEST_BOOTSTRAP_NOT_RECORDED%'
+        then 'FAIL: the first account was admitted but not written to the allowlist, so the exemption never closes.'
+      else 'FAIL: ' || left(sqlerrm, 130)
+    end;
+    return next;
+  end;
+
+  delete from auth_allowlist where email like 'selftest-%@omnios.invalid';
+
   -- ---------- cleanup ----------
   perform set_config('request.jwt.claims', '', true);
   perform set_config('request.headers', '', true);
