@@ -48,6 +48,38 @@ The passing guard suite is meaningful because it found defects in the enforcemen
 4. **Over-redaction damaged evidence URLs.** The old `sk-` API-key pattern matched inside the ordinary word `risk-management`, mangling a NIST evidence URL. `packages/shared/src/redact.ts` now anchors provider-key patterns on non-word boundaries. This matters because over-redaction destroys the verifiability of the evidence trail.
 5. **A guard that invented an enum value.** Migration `0009` compared `agents.status` to `'disabled'`, which is not a member of the `agent_status` enum (`offline`, `idle`, `running`, `paused`, `error`). Every insert of an agent-assigned job failed with `22P02` — the guard failed closed rather than open, so nothing was ever wrongly permitted, but it was still broken. Migration `0010` uses `paused`. Caught by the test suite before any real use.
 
+## A defect testing did not find
+
+Worth its own heading, because the other five were caught by the suite and
+this one was caught by the owner trying to use the thing.
+
+**The Approve button had never worked.** Clicking it returned
+`Unrecognised decision ""`. The two buttons carried
+`name="decision" value="approved|denied"`, which is correct HTML — the
+submitter's name and value are part of the submitted data — but React 19's
+`<form action={fn}>` path builds the FormData without the submitter, so
+`decision` never arrived. Measured against a probe page rather than reasoned
+about: on a mouse click, on keyboard activation, with a note and without,
+`id` and `note` arrived every time and `decision` never did.
+
+Fixed by making the decision a bound argument
+(`action.bind(null, 'approved')` on each button's `formAction`) so it does not
+depend on browser and framework agreeing about submitters, and so a caller
+that omits it fails to compile.
+
+The uncomfortable part is not the bug, it is where it was. Guard test 07 — *a
+signed-in user can approve, decision recorded* — passes, and always did. It
+exercises SQL. Seventy database tests and seventy-four unit tests covered
+everything the database refuses and nothing about whether a human could
+actually say yes. The single human action the whole system exists to make safe
+was the one path nothing checked.
+
+The gap is still open: there is no browser-level test of the console, so the
+same class of defect could recur in the pause control or the policy form. The
+pause was inspected by hand and is safe — it carries its value in a hidden
+input, which is included — but "inspected by hand" is what this section is
+about.
+
 ## Three highest-value next improvements
 
 Volume limits (`0014`) and "agents cannot destroy" (`0015`) are done, and
