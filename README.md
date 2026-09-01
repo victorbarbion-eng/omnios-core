@@ -119,9 +119,15 @@ it just renders almost unstyled. The only visible symptom is a
 
 ## Verification status
 
-**Verified:** `npx vitest run` reports 58/58 TypeScript unit tests passing across policy, workspace-boundary, redaction, and adapter tests. The final database guard run reports 30/30 passing against the migrated Supabase project; it covers prohibited actions, job transitions, approval identity, pause behavior, append-only audit history, policy promotion, expiry, retries, idempotency, RLS, actor attribution, and project-deletion history retention.
+**Verified:** `npx vitest run` reports 58/58 TypeScript unit tests. `npm run db:guards` reports **49/49** against the live Supabase project, covering prohibited actions, job transitions, approval identity, pause behaviour, append-only audit history, policy promotion, expiry, retries, idempotency, RLS, actor attribution, project-deletion history retention, and — from `0011`/`0012` — atomic claiming, lease ownership over both the direct-session and PostgREST paths, mid-flight pause cancellation, and lease reaping. `tests/concurrent_claim.sh` proves the claim race separately with eight real concurrent connections, which a single-transaction test function structurally cannot do.
 
-**Not yet verified:** the builder did not execute the local runner end to end with a service-role key, because that key was not supplied to the builder. The runner paths are therefore supported by type-checking, unit tests, and the database guard suite, not by a recorded live runner execution. The dashboard has local implementation and build output in the workspace, but no Vercel deployment has been made.
+Verified live by the owner, not by the builder:
+
+- `npm run agent:demo` — the runner executing end to end against the live database, filing an artifact, evidence, and a real approval request, and sending nothing.
+- The dashboard's signed-in views rendering live data.
+- `npm run agent:leasecheck` — 41 lease renewals, then the emergency pause refusing the 42nd and the runner stopping a job that was already running.
+
+**Not yet verified:** no Vercel deployment has been made. The five integration adapters remain inert by design (`OMNIOS_ADAPTER_DISABLED`). `max_concurrent_jobs` is stored and still not read. See `docs/known-limitations.md`, which is kept deliberately conservative.
 
 ## Read next
 

@@ -3,14 +3,22 @@
 Project: **omnios-core** — secure, visible, hybrid personal operating system
 Repo (local): `/home/user/workspace/omnios-core`
 Supabase project: `omnios-core` / ref `bvxjthifyekabpkmpcji` / eu-west-3 / free tier, $0/month
-Last updated: 2026-08-17
+Last updated: 2026-09-01
 
 ## Current phase
 
-Steps 1–8 of the build are complete and verified locally. Nothing has been deployed,
-sent, published, or pushed to a remote. Remaining work is in your hands: create the
-private GitHub repo and push, create a Supabase Auth user for the dashboard, and
-optionally run the agent demo against the live database with a service-role key.
+Steps 1–8 complete. Since then the system has moved from "extensively tested, never
+used" to "in use": the repo is pushed, an Auth user exists, the demo data is owned by
+a real account, the dashboard has rendered live, and the runner has executed end to
+end against the live database. Migrations 0011 and 0012 added atomic job leasing,
+which also closed the mid-flight half of the emergency pause.
+
+Since then: migrations 0012 and 0013 landed, an MCP server was added, and Hermes now
+files work through it from inside a container. See "Verified live" below.
+
+Still not done: no Vercel deployment, the five adapters remain inert by design,
+`max_concurrent_jobs` is stored and ignored, agents still hold a key that can destroy
+data even though it cannot act wrongly, and approving still requires the Mac.
 
 ## Completed
 
@@ -27,7 +35,7 @@ optionally run the agent demo against the live database with a service-role key.
 
 - **TypeScript:** `npx tsc -b packages/shared local-agent` — clean. Dashboard `next build` — clean, 11 routes, zero type errors, no `any`, no `@ts-ignore`.
 - **Unit tests:** `npx vitest run` — **58/58 passing** (policy engine, workspace boundary, secret redaction, adapter inertness).
-- **In-database guard tests:** `tests/db_guards.sql` — **33/33 passing** against the live project (run 4). Covers prohibited actions, illegal state transitions, unapproved execution, human-session requirement for approvals, self-approval block, emergency pause behaviour for read vs write, append-only audit, retry limits, idempotency, RLS isolation between owners, no-delete for the dashboard role, actor-type resolution, stale approval expiry, self-promotion block, and per-agent grant enforcement. Full run records in `docs/test-runs/`.
+- **In-database guard tests:** `npm run db:guards` — **49/49 passing** against the live project (run 4). Covers prohibited actions, illegal state transitions, unapproved execution, human-session requirement for approvals, self-approval block, emergency pause behaviour for read vs write, append-only audit, retry limits, idempotency, RLS isolation between owners, no-delete for the dashboard role, actor-type resolution, stale approval expiry, self-promotion block, per-agent grant enforcement, and — from 0011/0012 — atomic claiming, lease ownership over both the direct-session and PostgREST paths, mid-flight pause cancellation, and lease reaping. The claim race itself is proved separately by `tests/concurrent_claim.sh`, which needs eight real concurrent connections: `os_selftest()` runs in one transaction and structurally cannot test what separate transactions do at the same instant. Earlier run records in `docs/test-runs/`.
 - **Final database state:** demo seed intact (1 project, 3 tasks, 3 jobs, 2 approvals, 1 agent, 1 artifact, 2 evidence), 64 audit events, `emergency_pause = false`, no test or probe leftovers.
 
 ## Defects found by testing and fixed
@@ -42,11 +50,39 @@ Five real bugs, four of them mine, all caught before use:
 
 ## Blockers / open items
 
-- **GitHub repo creation is blocked.** The GitHub connector returns `403 user_blocked` on write and user endpoints, so I could not create the private repo. A first local commit exists; you push manually (commands in the README and in the final report).
-- **No service-role key was ever supplied**, so the agent runner has never executed end-to-end against the live database from here. It is verified by typecheck, 58 unit tests and the 33 in-database guard tests, not by a live run. Run `npm run agent:demo` on your Mac to close that gap.
-- **Dashboard authenticated views are unverified.** No Supabase Auth user exists yet. Every page's query was replayed against live PostgREST (all 200; a bogus column returned `42703`, proving the column names are real), but rendering with data has not been seen.
-- `max_concurrent_jobs` is stored but the runner does not read it.
-- Emergency pause prevents new write-capable jobs from starting; it does not kill work already running.
+- ~~GitHub repo creation is blocked.~~ Pushed. `master` and `feat/job-leasing` are on
+  GitHub; the repo is public.
+- ~~No service-role key was ever supplied, so the runner has never executed end to
+  end.~~ Done — see Verified live below.
+- ~~Dashboard authenticated views are unverified.~~ Done — rendered with live data.
+- ~~Emergency pause does not stop work already running.~~ Closed by 0011/0012 for any
+  worker that heartbeats, and observed with `npm run agent:leasecheck`. Cancellation
+  is cooperative and lands between steps, not mid-step.
+- `max_concurrent_jobs` is stored but the runner still does not read it. It matters
+  once there is more than one worker.
+- Nothing is deployed to Vercel.
+- The five integration adapters are inert by design.
+
+## Verified live
+
+Run by the owner against the live project, not by the builder:
+
+- `npm run db:guards` — **54/54**, including 34–49 (leasing, lease ownership over the
+  PostgREST path, mid-flight pause cancellation, reaping) and 50–54 (approval payload
+  binding). Test 53 disables the freeze trigger and shows the digest alone still
+  refuses a swapped payload.
+- `npx vitest run` — 67/67, including a schema-contract test that reads the migrations
+  and checks every column the MCP tools touch.
+- **Hermes, in a container, filing work through the MCP server.** It read the pause
+  state and project list from the live database; `omnios_policy_check` reported
+  send_message as needs_approval; and an attempt to queue `exfiltrate_secrets` was
+  refused with OMNIOS_PROHIBITED by the database trigger, three layers below the tool
+  it was holding. Hermes read the refusal and stopped rather than retrying.
+- `npm run agent:demo` — research and draft jobs completed, artifact and evidence
+  filed, `send_message` parked at `awaiting_approval`. Nothing sent.
+- `npm run agent:leasecheck` — 41 renewals, pause engaged, 42nd refused with
+  `OMNIOS_EMERGENCY_PAUSE`, job moved to `failed`, nothing further attempted.
+- Dashboard signed in, all pages rendering live rows.
 
 ## Decisions locked
 

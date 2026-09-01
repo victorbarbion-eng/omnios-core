@@ -885,6 +885,218 @@ begin
     detail := left(sqlerrm, 140); return next;
   end;
 
+  -- =====================================================================
+  -- 0014 — limits on QUANTITY.
+  --
+  -- Everything above asks whether an action is allowed. These ask how
+  -- many, which is the failure an approval gate is structurally blind
+  -- to: ten thousand individually permitted jobs contain no bad row.
+  -- =====================================================================
+
+  perform set_config('omnios.actor_type', 'system', true);
+
+  -- ============ 55. a new owner gets budgets automatically ==========
+  -- Without this the guard fails open for anyone who joined after the
+  -- migration, and the control silently does nothing while looking
+  -- configured — the worst way for a limit to be wrong.
+  begin
+    test := '55 creating a project gives its owner default budgets';
+    select count(*) into n from usage_budgets where owner_id = owner_a;
+    passed := (n = 5);
+    detail := format('%s budget rows for the test owner (expected 5)', n);
+    return next;
+  exception when others then
+    test := '55 creating a project gives its owner default budgets';
+    passed := false; detail := 'FAIL: ' || sqlerrm; return next;
+  end;
+
+  -- ============ 56. demo rows do not consume budget ================
+  -- Every job this suite creates is is_demo. If they counted, running
+  -- the tests would exhaust a real allowance and later runs would fail
+  -- for reasons unrelated to what they assert.
+  begin
+    update usage_budgets set max_per_day = 0
+     where owner_id = owner_a and risk_level = 'read';
+
+    insert into jobs (owner_id, project_id, agent_id, job_type, idempotency_key, is_demo)
+    values (owner_a, p_id, ag_id, 'read_source', 'selftest:budget:demo', true);
+
+    test := '56 demo rows are exempt from the daily budget';
+    passed := true;
+    detail := 'a demo job was accepted against a zero budget, as intended';
+    return next;
+  exception when others then
+    test := '56 demo rows are exempt from the daily budget';
+    passed := false; detail := 'FAIL: ' || sqlerrm; return next;
+  end;
+
+  -- ============ 57. a real job IS refused over budget ==============
+  begin
+    insert into jobs (owner_id, project_id, agent_id, job_type, idempotency_key, is_demo)
+    values (owner_a, p_id, ag_id, 'read_source', 'selftest:budget:real', false);
+
+    test := '57 a non-demo job is refused once the daily budget is spent';
+    passed := false; detail := 'FAIL: budget was ignored'; return next;
+  exception when others then
+    test := '57 a non-demo job is refused once the daily budget is spent';
+    passed := sqlerrm like 'OMNIOS_BUDGET_EXCEEDED%';
+    detail := left(sqlerrm, 150); return next;
+  end;
+
+  update usage_budgets set max_per_day = 500
+   where owner_id = owner_a and risk_level = 'read';
+
+  -- ============ 58. an agent at capacity claims nothing more =======
+  -- max_concurrent_jobs has sat in system_settings since 0003 with
+  -- nothing reading it. Set it to 1 and confirm a second claim is
+  -- refused while the first is still held.
+  begin
+    update system_settings set value = to_jsonb(1) where key = 'max_concurrent_jobs';
+    perform set_config('omnios.claimant_agent_id', '', true);
+
+    -- Speak as the lease holder, or os_guard_job_lease refuses these
+    -- exactly as it is supposed to.
+    perform set_config('omnios.claimant_agent_id', ag_id::text, true);
+    update jobs set status = 'cancelled'
+     where owner_id = owner_a and status in ('queued','claimed','running');
+    perform set_config('omnios.claimant_agent_id', '', true);
+
+    insert into jobs (owner_id, project_id, job_type, idempotency_key, is_demo)
+    values (owner_a, p_id, 'read_source', 'selftest:cap:one', true);
+    insert into jobs (owner_id, project_id, job_type, idempotency_key, is_demo)
+    values (owner_a, p_id, 'read_source', 'selftest:cap:two', true);
+
+    lease_a := os_claim_next_job(ag_id, 60, owner_a);
+    lease_b := os_claim_next_job(ag_id, 60, owner_a);
+
+    test := '58 an agent at max_concurrent_jobs is handed nothing more';
+    passed := (lease_a.id is not null and lease_b.id is null);
+    detail := case
+      when lease_a.id is null then 'FAIL: the first claim returned nothing'
+      when lease_b.id is not null then 'FAIL: a second job was handed out at capacity'
+      else 'first claim succeeded, second returned null while at capacity' end;
+    return next;
+  exception when others then
+    test := '58 an agent at max_concurrent_jobs is handed nothing more';
+    passed := false; detail := 'FAIL: ' || sqlerrm; return next;
+  end;
+
+  update system_settings set value = to_jsonb(2) where key = 'max_concurrent_jobs';
+  perform set_config('omnios.claimant_agent_id', '', true);
+
+  -- =====================================================================
+  -- 0015 — an agent cannot destroy.
+  --
+  -- Until now every guard answered "may this happen?", and deletion was
+  -- never something an agent was supposed to want, so no rule covered
+  -- it. Absence of intent is not a control.
+  -- =====================================================================
+
+  -- Simulate the runner and MCP server exactly: a PostgREST request
+  -- carrying a key, with no signed-in human behind it.
+  perform set_config('omnios.actor_type', '', true);
+  perform set_config('request.jwt.claims', '', true);
+  -- Something must EXIST to be deleted. A BEFORE DELETE trigger cannot
+  -- fire on zero rows, so an empty table makes a delete "succeed" and
+  -- the test pass while proving nothing. The first version of tests 59
+  -- and 62 did exactly that.
+  insert into artifacts (owner_id, project_id, name, artifact_type, location_kind, inline_body, is_demo)
+  values (owner_a, p_id, 'selftest target', 'note', 'inline', 'delete me', true);
+
+  perform set_config('request.headers',
+    '{"x-omnios-actor":"agent","x-omnios-actor-name":"selftest-runner"}', true);
+
+  -- ============ 59. a keyed connection cannot delete ================
+  begin
+    delete from artifacts where owner_id = owner_a and name = 'selftest target';
+    test := '59 a key-based connection cannot delete records';
+    passed := false; detail := 'FAIL: an agent deleted records'; return next;
+  exception when others then
+    test := '59 a key-based connection cannot delete records';
+    passed := sqlerrm like 'OMNIOS_AGENT_CANNOT_DELETE%';
+    detail := left(sqlerrm, 130); return next;
+  end;
+
+  -- ============ 60. nor delete a whole project ======================
+  begin
+    delete from projects where id = p_id;
+    test := '60 a key-based connection cannot delete a project';
+    passed := false; detail := 'FAIL: an agent deleted a project'; return next;
+  exception when others then
+    test := '60 a key-based connection cannot delete a project';
+    passed := sqlerrm like 'OMNIOS_AGENT_CANNOT_DELETE%';
+    detail := left(sqlerrm, 130); return next;
+  end;
+
+  -- ============ 61. nor hide a row by reassigning it ================
+  -- Handing a row to another owner removes it from view as effectively
+  -- as deleting it, and would pass the guard above.
+  begin
+    update projects set owner_id = owner_b where id = p_id;
+    test := '61 a key-based connection cannot reassign ownership';
+    passed := false; detail := 'FAIL: an agent gave a project away'; return next;
+  exception when others then
+    test := '61 a key-based connection cannot reassign ownership';
+    passed := sqlerrm like 'OMNIOS_OWNER_IMMUTABLE%';
+    detail := left(sqlerrm, 130); return next;
+  end;
+
+  -- ============ 62. spoofing the actor header does not help =========
+  -- os_actor_type() takes x-omnios-actor at face value by design, for
+  -- attribution. If the delete guard were built on it, claiming to be a
+  -- user would be enough. It is built on the request CHANNEL instead,
+  -- which the caller does not control.
+  begin
+    perform set_config('request.headers',
+      '{"x-omnios-actor":"user","x-omnios-actor-name":"definitely-a-human"}', true);
+    delete from artifacts where owner_id = owner_a and name = 'selftest target';
+    test := '62 claiming to be a user in a header does not permit deletion';
+    passed := false; detail := 'FAIL: a spoofed actor header bypassed the guard'; return next;
+  exception when others then
+    test := '62 claiming to be a user in a header does not permit deletion';
+    passed := sqlerrm like 'OMNIOS_AGENT_CANNOT_DELETE%';
+    detail := left(sqlerrm, 130); return next;
+  end;
+
+  -- ============ 63. a direct session may still delete ===============
+  -- The point is to stop AGENTS, not to make your own data
+  -- unmanageable. No request.headers means no API request means you, at
+  -- a terminal.
+  begin
+    perform set_config('request.headers', '', true);
+    perform set_config('omnios.actor_type', 'user', true);
+    insert into artifacts (owner_id, project_id, name, artifact_type, location_kind, inline_body, is_demo)
+    values (owner_a, p_id, 'selftest deletable', 'note', 'inline', 'x', true);
+    delete from artifacts where owner_id = owner_a and name = 'selftest deletable';
+
+    test := '63 a direct database session may still delete';
+    select count(*) into n from artifacts where owner_id = owner_a and name = 'selftest deletable';
+    passed := (n = 0);
+    detail := 'a human at a terminal deleted a row, as intended'; return next;
+  exception when others then
+    test := '63 a direct database session may still delete';
+    passed := false; detail := 'FAIL: ' || sqlerrm; return next;
+  end;
+
+  -- ============ 64. no budget configured means refused ==============
+  -- 0014 failed open here. A limit that depends on a row existing is
+  -- not a limit.
+  begin
+    delete from usage_budgets where owner_id = owner_a and risk_level = 'read';
+    insert into jobs (owner_id, project_id, agent_id, job_type, idempotency_key, is_demo)
+    values (owner_a, p_id, ag_id, 'read_source', 'selftest:nobudget', false);
+
+    test := '64 a job is refused when no budget is configured at all';
+    passed := false; detail := 'FAIL: unlimited work with no budget row'; return next;
+  exception when others then
+    test := '64 a job is refused when no budget is configured at all';
+    passed := sqlerrm like 'OMNIOS_NO_BUDGET%';
+    detail := left(sqlerrm, 130); return next;
+  end;
+
+  perform set_config('request.headers', '', true);
+  perform set_config('omnios.actor_type', 'user', true);
+
   -- ---------- cleanup ----------
   perform set_config('request.jwt.claims', '', true);
   perform set_config('request.headers', '', true);
