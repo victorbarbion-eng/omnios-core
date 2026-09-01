@@ -142,7 +142,7 @@ export const TOOLS: OmniosTool[] = [
     async handler(ctx) {
       const { data, error } = await ctx.db
         .from('approvals')
-        .select('id, action_type, status, reason, requested_at, expires_at, job_id')
+        .select('id, action_type, status, action_preview, target_reference, requested_at, expires_at, job_id')
         .eq('owner_id', ctx.ownerId)
         .eq('status', 'pending')
         .order('requested_at');
@@ -164,7 +164,9 @@ export const TOOLS: OmniosTool[] = [
     async handler(ctx, args) {
       const { data, error } = await ctx.db
         .from('approvals')
-        .select('id, action_type, status, reason, decision_note, requested_at, decided_at, expires_at')
+        .select(
+          'id, action_type, status, action_preview, target_reference, decision_note, requested_at, decided_at, expires_at, executed_at',
+        )
         .eq('owner_id', ctx.ownerId)
         .eq('id', String(args['approval_id']))
         .maybeSingle();
@@ -220,8 +222,15 @@ export const TOOLS: OmniosTool[] = [
       project_slug: z.string(),
       title: z.string(),
       source_url: z.string().url(),
+      publisher: z.string().optional(),
       excerpt: z.string().max(2000),
-      relevance: z.string().max(1000).describe('Why this supports the claim you are making'),
+      relevance_note: z.string().max(1000).describe('Why this supports the claim you are making'),
+      confidence: z
+        .number()
+        .min(0)
+        .max(1)
+        .optional()
+        .describe('Your own 0–1 confidence. Be honest; overconfidence here is worse than a low number.'),
     },
     readOnly: false,
     async handler(ctx, args) {
@@ -233,15 +242,18 @@ export const TOOLS: OmniosTool[] = [
           project_id: projectId,
           title: String(args['title']),
           source_url: String(args['source_url']),
+          publisher: args['publisher'] === undefined ? null : String(args['publisher']),
           excerpt: String(args['excerpt']),
-          relevance: String(args['relevance']),
-          verification_status: 'unverified',
-          captured_by: ctx.agentName,
+          relevance_note: String(args['relevance_note']),
+          confidence: args['confidence'] === undefined ? null : Number(args['confidence']),
+          // Nothing here verifies anything. Recorded as unverified because
+          // that is what it is; see docs/mcp-server.md.
+          verification: 'unverified',
         })
-        .select('id, title')
+        .select('id, title, verification')
         .single();
       if (error) fail(error.message);
-      return ok({ ...data, verification_status: 'unverified' });
+      return ok(data);
     },
   },
 
@@ -285,26 +297,49 @@ export const TOOLS: OmniosTool[] = [
       'Park a consequential action and ask for a decision. This is the ONLY route to anything approval-class. Write the reason for a human who has not been following your work: what you want to do, to whom or what, and why. A vague reason gets denied, and it should be.',
     inputSchema: {
       job_id: z.string().uuid().describe('The queued job this approval would authorise'),
-      action_type: z.string(),
-      reason: z.string().min(20).max(2000).describe('Plain language, addressed to the person deciding'),
+      action_preview: z
+        .string()
+        .min(20)
+        .max(2000)
+        .describe('Plain language, addressed to the person deciding: exactly what would happen if they say yes'),
+      target_reference: z
+        .string()
+        .min(1)
+        .max(500)
+        .describe('Who or what it would happen TO — a recipient, a file path, an account'),
       expires_in_hours: z.number().int().min(1).max(168).default(24),
     },
     readOnly: false,
     async handler(ctx, args) {
       const hours = Number(args['expires_in_hours'] ?? 24);
+
+      // project_id and action_type are taken from the JOB, not from the
+      // agent's arguments. An agent that could name its own action_type
+      // here could request approval for something harmless and attach it
+      // to a job that does something else.
+      const job = await ctx.db
+        .from('jobs')
+        .select('id, project_id, job_type, status, input_reference')
+        .eq('owner_id', ctx.ownerId)
+        .eq('id', String(args['job_id']))
+        .maybeSingle();
+      if (job.error) fail(job.error.message);
+      if (!job.data) fail('OMNIOS_UNKNOWN_JOB: no job with that id belongs to this owner.');
+
       const { data, error } = await ctx.db
         .from('approvals')
         .insert({
           owner_id: ctx.ownerId,
-          job_id: String(args['job_id']),
-          action_type: String(args['action_type']),
+          project_id: job.data.project_id,
+          job_id: job.data.id,
+          action_type: job.data.job_type,
           status: 'pending',
-          reason: String(args['reason']),
-          requested_by_actor_type: 'agent',
-          requested_by_name: ctx.agentName,
+          action_preview: String(args['action_preview']),
+          action_payload: redactObject((job.data.input_reference ?? {}) as Record<string, unknown>),
+          target_reference: String(args['target_reference']),
           expires_at: new Date(Date.now() + hours * 3_600_000).toISOString(),
         })
-        .select('id, status, expires_at')
+        .select('id, status, action_type, expires_at')
         .single();
       if (error) fail(error.message);
       return ok({

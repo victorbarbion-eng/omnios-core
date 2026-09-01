@@ -62,7 +62,7 @@ describe('MCP tool surface', () => {
     // A one-word reason means the human deciding has nothing to decide on.
     // Denying a vague request is correct, so make vagueness impossible.
     const tool = TOOLS.find((t) => t.name === 'omnios_request_approval');
-    const schema = tool?.inputSchema['reason'];
+    const schema = tool?.inputSchema['action_preview'];
     expect(schema).toBeDefined();
     expect(() => schema!.parse('ok')).toThrow();
     expect(() => schema!.parse('Send the quarterly brief to the consultant for review.')).not.toThrow();
