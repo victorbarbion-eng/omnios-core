@@ -48,10 +48,11 @@ The passing guard suite is meaningful because it found defects in the enforcemen
 4. **Over-redaction damaged evidence URLs.** The old `sk-` API-key pattern matched inside the ordinary word `risk-management`, mangling a NIST evidence URL. `packages/shared/src/redact.ts` now anchors provider-key patterns on non-word boundaries. This matters because over-redaction destroys the verifiability of the evidence trail.
 5. **A guard that invented an enum value.** Migration `0009` compared `agents.status` to `'disabled'`, which is not a member of the `agent_status` enum (`offline`, `idle`, `running`, `paused`, `error`). Every insert of an agent-assigned job failed with `22P02` — the guard failed closed rather than open, so nothing was ever wrongly permitted, but it was still broken. Migration `0010` uses `paused`. Caught by the test suite before any real use.
 
-## A defect testing did not find
+## Two defects testing did not find
 
 Worth its own heading, because the other five were caught by the suite and
-this one was caught by the owner trying to use the thing.
+these two were caught by the owner trying to use the thing. They were stacked:
+fixing the first only revealed the second.
 
 **The Approve button had never worked.** Clicking it returned
 `Unrecognised decision ""`. The two buttons carried
@@ -74,11 +75,43 @@ everything the database refuses and nothing about whether a human could
 actually say yes. The single human action the whole system exists to make safe
 was the one path nothing checked.
 
-The gap is still open: there is no browser-level test of the console, so the
-same class of defect could recur in the pause control or the policy form. The
-pause was inspected by hand and is safe — it carries its value in a hidden
-input, which is included — but "inspected by hand" is what this section is
-about.
+The pause control was inspected by hand and is unaffected — it carries its
+value in a hidden input, which is included.
+
+**And underneath it, the audit trigger blocked the approval anyway.** With the
+button fixed, the next click returned
+`new row violates row-level security policy for table "audit_events"` (42501).
+`os_write_audit()` was SECURITY INVOKER, so the audit insert ran with the
+caller's privileges, and `audit_events` has a SELECT policy for `authenticated`
+and no INSERT policy — correctly, since a browser client has no business
+writing audit rows directly. The audit write failed, and being in the same
+transaction, took the approval down with it. Fixed by migration
+`0017_audit_writes_as_definer.sql`: the trail is a property of the system, not
+an action of the actor, and must not depend on the actor holding a grant — for
+the same reason it is append-only. Granting `authenticated` an INSERT policy
+was rejected, because it would let a signed-in client compose arbitrary audit
+rows over PostgREST.
+
+So the approval path worked for every actor **except a real signed-in human**,
+which is the only actor permitted to approve. The one path that mattered was
+the one path that could not write its own history.
+
+### Why the suite missed both
+
+`os_selftest()` runs as the migration role, which owns the tables and is
+therefore exempt from row-level security. That is right for testing what the
+guards **refuse** — it proves refusal holds even against a connection that
+bypasses RLS, which is the whole point. It is exactly wrong for testing what
+they **permit**: every "a signed-in user can…" test was passing on a road no
+browser travels.
+
+Guard tests 71 and 72 now `set local role authenticated` first and approve, and
+operate the pause, the way the console does. Test 71 fails with the identical
+42501 if `0017` is reverted — verified by doing so.
+
+Still open: there is no browser-level test of the console at all. Both defects
+here were in the layer between "the database is correct" and "a person can use
+it", and nothing automated looks at that layer.
 
 ## Three highest-value next improvements
 

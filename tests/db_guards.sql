@@ -37,6 +37,7 @@ declare
   exp_2    timestamptz;
   j_bind   uuid;
   ap_bind  uuid;
+  ap_rls   uuid;
 begin
   -- ---------- fixtures ----------
   delete from projects where slug in ('selftest-project', 'selftest-other');
@@ -1261,6 +1262,87 @@ begin
   end;
 
   delete from auth_allowlist where email like 'selftest-%@omnios.invalid';
+
+  -- ============ 71. approving AS the dashboard actually does =========
+  -- Every other test in this file runs as the migration role, which owns
+  -- the tables and is therefore exempt from row-level security. That is
+  -- right for testing what the guards REFUSE — it proves refusal holds
+  -- even against a connection that bypasses RLS.
+  --
+  -- It is exactly wrong for testing what the guards PERMIT. Test 07 says
+  -- "a signed-in user can approve" and has always passed, while the
+  -- dashboard could not approve at all: the audit trigger inserts into
+  -- audit_events, which has a SELECT policy for `authenticated` and no
+  -- INSERT policy, so the write died with 42501 before the approval
+  -- could commit. Two layers of the same mistake — checking the rule
+  -- and never checking the road.
+  --
+  -- This one switches to the `authenticated` role first, so it travels
+  -- the road the browser travels.
+  begin
+    perform set_config('request.jwt.claims',
+      json_build_object('sub', owner_a, 'role', 'authenticated')::text, true);
+    perform set_config('request.headers', '', true);
+    perform set_config('omnios.actor_type', '', true);
+
+    insert into approvals (owner_id, project_id, requested_by_agent_id, job_id, action_type,
+                           action_preview, target_reference, is_demo)
+    values (owner_a, p_id, ag_id, j_send, 'send_message',
+            'selftest: the path the browser takes', 'email:nobody@example.invalid', true)
+    returning id into ap_rls;
+
+    set local role authenticated;
+    update approvals set status = 'approved', decision_note = 'via the authenticated role'
+     where id = ap_rls;
+    reset role;
+
+    test := '71 a signed-in user can approve through the authenticated role';
+    select count(*) into n from approvals where id = ap_rls and status = 'approved';
+    passed := (n = 1);
+    detail := case when n = 1
+                   then 'the path the dashboard uses, audit row and all'
+                   else 'FAIL: the update did not land' end;
+    return next;
+  exception when others then
+    reset role;
+    test := '71 a signed-in user can approve through the authenticated role';
+    passed := false;
+    detail := 'FAIL: ' || left(sqlerrm, 150); return next;
+  end;
+
+  -- ============ 72. the kill switch, from the same road =============
+  -- The other consequential button in the console, and the one whose
+  -- failure would matter most. os_set_emergency_pause() has been
+  -- SECURITY DEFINER since 0008, so it was never exposed to the defect
+  -- 0017 fixed — but "was never exposed" was an inference until this
+  -- test, and the inference is exactly what failed for the approve path.
+  begin
+    perform set_config('request.jwt.claims',
+      json_build_object('sub', owner_a, 'role', 'authenticated')::text, true);
+    perform set_config('request.headers', '', true);
+    perform set_config('omnios.actor_type', '', true);
+
+    set local role authenticated;
+    perform os_set_emergency_pause(true, 'selftest: pause from the browser path');
+    perform os_set_emergency_pause(false, 'selftest: release from the browser path');
+    reset role;
+
+    test := '72 a signed-in user can operate the emergency pause';
+    select count(*) into n from system_settings
+     where key = 'emergency_pause' and (value = 'false'::jsonb or value = to_jsonb(false));
+    passed := (n = 1);
+    detail := case when n = 1
+                   then 'engaged and released through the authenticated role'
+                   else 'FAIL: pause did not return to released' end;
+    return next;
+  exception when others then
+    reset role;
+    test := '72 a signed-in user can operate the emergency pause';
+    passed := false; detail := 'FAIL: ' || left(sqlerrm, 150); return next;
+  end;
+
+  perform set_config('request.jwt.claims', '', true);
+  perform set_config('omnios.actor_type', 'user', true);
 
   -- ---------- cleanup ----------
   perform set_config('request.jwt.claims', '', true);
